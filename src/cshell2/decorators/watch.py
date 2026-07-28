@@ -17,6 +17,7 @@ from .. import terminal
 from ..colors import _bg, _fg, get_color_scheme
 from ..commands import arg
 from ..pipeline import Pipeline, Redirect
+from ..scrollbar import render_column as _scrollbar_column
 from . import registry as decorator_registry
 
 
@@ -257,29 +258,24 @@ def _render_scrollbar(
     Empty when content fits on screen.  Otherwise a thumb proportional
     to the visible window; track is the rest.  Colors come from the
     active ColorScheme (shared with the inline picker's scrollbar).
+
+    The thumb slides in 1/8-row steps via the shared sub-cell renderer
+    (see ``cshell2.scrollbar``) so scrolling reads smoothly instead of
+    snapping a whole row at a time.
     """
     if body_rows <= 0:
         return []
     if total_lines <= body_rows:
         return [" "] * body_rows
     s = get_color_scheme()
-    thumb = _bg(*s.scroll_thumb) + " " + _RESET
-    track = _bg(*s.scroll_track) + " " + _RESET
-    # Thumb size: at least 1, at most body_rows.
-    thumb_size = max(1, int(round(body_rows * body_rows / total_lines)))
-    travel = body_rows - thumb_size
-    if travel <= 0:
-        thumb_start = 0
-    else:
-        scroll_travel = max(0, total_lines - body_rows)
-        thumb_start = int(round(travel * (scroll_y / scroll_travel))) if scroll_travel else 0
-    bar: list[str] = []
-    for i in range(body_rows):
-        if thumb_start <= i < thumb_start + thumb_size:
-            bar.append(thumb)
-        else:
-            bar.append(track)
-    return bar
+    return _scrollbar_column(
+        height=body_rows,
+        offset=scroll_y,
+        visible=body_rows,
+        total=total_lines,
+        thumb=s.scroll_thumb,
+        track=s.scroll_track,
+    )
 
 
 # Escape-sequence stripper.  Tries to cover the common forms of ANSI

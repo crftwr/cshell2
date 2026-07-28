@@ -9,6 +9,7 @@ from typing import Callable, Generic, TypeVar
 
 from . import terminal
 from .colors import _bg, _fg, get_color_scheme
+from .scrollbar import render_column as _scrollbar_column
 
 T = TypeVar("T")
 
@@ -270,12 +271,14 @@ class InlinePicker(Generic[T]):
         out: list[str] = ["\0338\r\033[J"]  # restore to anchor, clear to end
 
         label_col, meta_col, panel_w = self._compute_layout()
+        has_scrollbar = len(self._items) > self._height
+        sb_cells = self._scrollbar_cells() if has_scrollbar else []
         for i, item in enumerate(visible):
             out.append(
                 self._format_row(
                     item,
                     selected=(i + self._offset == self._selected),
-                    row_index=i,
+                    scrollbar_cell=sb_cells[i] if has_scrollbar else "",
                     label_col=label_col,
                     meta_col=meta_col,
                     panel_w=panel_w,
@@ -338,14 +341,16 @@ class InlinePicker(Generic[T]):
             )
         return "".join(out)
 
-    def _scrollbar_char(self, row_index: int) -> str:
+    def _scrollbar_cells(self) -> list[str]:
         s = get_color_scheme()
-        n = len(self._items)
-        thumb_start = self._offset * self._height // n
-        thumb_end = max(thumb_start + 1, (self._offset + self._height) * self._height // n)
-        if thumb_start <= row_index < thumb_end:
-            return _bg(*s.scroll_thumb) + " \033[0m"
-        return _bg(*s.scroll_track) + " \033[0m"
+        return _scrollbar_column(
+            height=self._height,
+            offset=self._offset,
+            visible=self._height,
+            total=len(self._items),
+            thumb=s.scroll_thumb,
+            track=s.scroll_track,
+        )
 
     def _compute_layout(self) -> tuple[int, int, int]:
         """Return (label_col, meta_col, panel_w).
@@ -381,7 +386,7 @@ class InlinePicker(Generic[T]):
         item: T,
         *,
         selected: bool,
-        row_index: int = 0,
+        scrollbar_cell: str = "",
         label_col: int = 0,
         meta_col: int = 0,
         panel_w: int = 0,
@@ -389,7 +394,6 @@ class InlinePicker(Generic[T]):
         label = self._display_fn(item)
         meta = self._meta_fn(item) if self._meta_fn else ""
 
-        has_scrollbar = len(self._items) > self._height
         label = _wcs_clip(label, label_col)
         # Pad the label to label_col only when there's a meta column to align to.
         label_disp = _wcs_ljust(label, label_col) if meta_col else label
@@ -409,9 +413,9 @@ class InlinePicker(Generic[T]):
             inner = label_disp + (f"  \033[2m{meta}\033[22m" if meta else "")
             row = f"\r{col_move}{bg}{inner}{pad}\033[0m"
 
-        if has_scrollbar:
+        if scrollbar_cell:
             sb_col = self._col + panel_w + 1  # 1-indexed terminal column
-            row += f"\033[{sb_col}G{self._scrollbar_char(row_index)}"
+            row += f"\033[{sb_col}G{scrollbar_cell}"
         return row
 
     def _cleanup(self) -> None:
@@ -774,9 +778,11 @@ class InlineMultiPicker(Generic[T]):
         out: list[str] = ["\0338\r\033[J"]
 
         panel_w = self._compute_panel_w()
+        has_scrollbar = len(self._items) > self._height
+        sb_cells = self._scrollbar_cells() if has_scrollbar else []
         for i, item in enumerate(visible):
             abs_i = self._offset + i
-            out.append(self._format_row(item, checked=(abs_i in self._checked), selected=(abs_i == self._selected), row_index=i, panel_w=panel_w))
+            out.append(self._format_row(item, checked=(abs_i in self._checked), selected=(abs_i == self._selected), scrollbar_cell=sb_cells[i] if has_scrollbar else "", panel_w=panel_w))
             if i < len(visible) - 1:
                 out.append("\n")
 
@@ -802,21 +808,22 @@ class InlineMultiPicker(Generic[T]):
     _CHECK_ON = "[x] "
     _CHECK_OFF = "[ ] "
 
-    def _scrollbar_char(self, row_index: int) -> str:
+    def _scrollbar_cells(self) -> list[str]:
         s = get_color_scheme()
-        n = len(self._items)
-        thumb_start = self._offset * self._height // n
-        thumb_end = max(thumb_start + 1, (self._offset + self._height) * self._height // n)
-        if thumb_start <= row_index < thumb_end:
-            return _bg(*s.scroll_thumb) + " \033[0m"
-        return _bg(*s.scroll_track) + " \033[0m"
+        return _scrollbar_column(
+            height=self._height,
+            offset=self._offset,
+            visible=self._height,
+            total=len(self._items),
+            thumb=s.scroll_thumb,
+            track=s.scroll_track,
+        )
 
-    def _format_row(self, item: T, *, checked: bool, selected: bool, row_index: int = 0, panel_w: int = 0) -> str:
+    def _format_row(self, item: T, *, checked: bool, selected: bool, scrollbar_cell: str = "", panel_w: int = 0) -> str:
         label = self._display_fn(item)
         meta = self._meta_fn(item) if self._meta_fn else ""
 
         check = self._CHECK_ON if checked else self._CHECK_OFF
-        has_scrollbar = len(self._items) > self._height
         content_avail = max(1, panel_w - len(check))
         # Align all labels to the widest one (in display columns); give the rest to the description.
         label_col = min(self._label_col_w, content_avail)
@@ -837,9 +844,9 @@ class InlineMultiPicker(Generic[T]):
             inner = check + label_padded + (f"  \033[2m{meta}\033[22m" if meta else "")
             row = f"\r{bg}{inner}{pad}\033[0m"
 
-        if has_scrollbar:
+        if scrollbar_cell:
             sb_col = panel_w + 1  # 1-indexed terminal column
-            row += f"\033[{sb_col}G{self._scrollbar_char(row_index)}"
+            row += f"\033[{sb_col}G{scrollbar_cell}"
 
         return row
 
