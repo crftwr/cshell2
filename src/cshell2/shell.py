@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import io
 import os
@@ -2070,6 +2071,71 @@ class Shell:
 
     _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)")
 
+    def _split_env_prefix(self, tokens: list[str]) -> tuple[dict[str, str], list[str]]:
+        """Split leading ``KEY=VALUE`` tokens into a per-command env prefix.
+
+        Supports the POSIX idiom ``FOO=bar BAZ=qux cmd args`` — the assignments
+        apply only to *cmd*'s environment, not the shell's.  Scanning stops at
+        the first non-assignment token (the command name); everything after it
+        is left untouched, so ``make FOO=bar`` keeps ``FOO=bar`` as an argument
+        to ``make`` (a Makefile override) rather than an env prefix.
+
+        Returns ``(env_prefix, rest)``.  When there is no command after the
+        assignments (a pure-assignment line) ``rest`` is empty and the caller
+        keeps the existing permanent-assignment behaviour.
+        """
+        env_prefix: dict[str, str] = {}
+        idx = 0
+        for token in tokens:
+            m = self._ASSIGNMENT_RE.match(token)
+            if m is None:
+                break
+            env_prefix[m.group(1)] = m.group(2)
+            idx += 1
+        rest = tokens[idx:]
+        # No trailing command → not a prefix; let pure-assignment handling run.
+        if not rest:
+            return {}, tokens
+        return env_prefix, rest
+
+    @staticmethod
+    def _merged_env(env_prefix: dict[str, str]) -> dict[str, str]:
+        """Return a copy of ``os.environ`` overlaid with *env_prefix*."""
+        env = dict(os.environ)
+        env.update(env_prefix)
+        return env
+
+    @contextlib.contextmanager
+    def _temp_environ(self, env_prefix: dict[str, str]):
+        """Apply *env_prefix* to ``os.environ`` for the duration of the block.
+
+        Used to give a Python ``@registry.command`` the same per-command
+        environment an external child gets from ``FOO=bar cmd``.  Restores the
+        prior values (or deletes keys that weren't set before) on exit.
+
+        In-process caveat: a Python stage in a *multi-stage* pipeline runs in a
+        worker thread, so a temporary mutation of the process-wide
+        ``os.environ`` is visible to sibling stages for the overlap window.
+        This mirrors the existing "stateful built-ins mutate the parent in
+        pipelines" limitation and only bites the rare ``FOO=bar pycmd | …``
+        case; external children are unaffected (they get their own ``env=``).
+        """
+        if not env_prefix:
+            yield
+            return
+        saved: dict[str, str | None] = {}
+        for key, value in env_prefix.items():
+            saved[key] = os.environ.get(key)
+            os.environ[key] = value
+        try:
+            yield
+        finally:
+            for key, prev in saved.items():
+                if prev is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prev
+
     def _unset_variable(self, key: str) -> None:
         """Remove a variable via var_registry, or fall back to plain os.environ / context removal."""
         py_var = var_registry.get(key)
@@ -2239,11 +2305,12 @@ class Shell:
         ``PipelineSlot`` as before.
         """
         if not IS_WINDOWS:
-            argv = self._pipeline_external_argv(pipeline)
-            if argv is not None:
+            ext = self._pipeline_external_argv(pipeline)
+            if ext is not None:
+                argv, env_prefix = ext
                 slot = ProcessSlot()
                 try:
-                    slot.start(argv=argv, env=dict(os.environ), cwd=os.getcwd())
+                    slot.start(argv=argv, env=self._merged_env(env_prefix), cwd=os.getcwd())
                 except FileNotFoundError:
                     print(f"cshell2: command not found: {argv[0]}")
                     return None
@@ -2268,7 +2335,10 @@ class Shell:
 
         Same gating as :meth:`_pipeline_external_argv` but inverted on the
         registry check: returns the registered :class:`Command` (with its
-        Python handler) rather than raw argv.
+        Python handler) rather than raw argv.  A per-command env prefix is not
+        threaded here — a backgrounded Python command runs in a long-lived
+        slot thread, so a temporary ``os.environ`` mutation can't be scoped to
+        it; ``@bg FOO=bar pycmd`` therefore falls through to ``PipelineSlot``.
         """
         if type(pipeline).run is not Pipeline.run:
             return None
@@ -2283,20 +2353,27 @@ class Shell:
         if not tokens:
             return None
         if all(self._ASSIGNMENT_RE.match(t) for t in tokens):
+            return None
+        env_prefix, tokens = self._split_env_prefix(tokens)
+        if env_prefix:
+            # Let PipelineSlot handle it — it applies the prefix per-stage.
             return None
         cmd = self.registry.get(tokens[0])
         if cmd is None or not cmd.has_any_handler():
             return None
         return cmd, tokens[1:]
 
-    def _pipeline_external_argv(self, pipeline: Pipeline) -> list[str] | None:
-        """Return argv if *pipeline* is a single-stage external command.
+    def _pipeline_external_argv(self, pipeline: Pipeline):
+        """Return ``(argv, env_prefix)`` if *pipeline* is a single-stage external command.
 
         Returns ``None`` for any pipeline that needs the PipelineSlot path:
         multi-stage, decorator-bodied, redirected, pure-assignment, empty,
         or whose first token resolves to a registered Python handler.
         Subclasses that override ``Pipeline.run`` (e.g. test helpers) also
         take the PipelineSlot path so the override actually runs.
+
+        A leading ``FOO=bar`` env prefix is split off and returned separately
+        so the caller can bake it into the ProcessSlot's environment.
         """
         if type(pipeline).run is not Pipeline.run:
             return None
@@ -2312,13 +2389,14 @@ class Shell:
             return None
         if all(self._ASSIGNMENT_RE.match(t) for t in tokens):
             return None
+        env_prefix, tokens = self._split_env_prefix(tokens)
         cmd = self.registry.get(tokens[0])
         # Recipes are registered as commands but have no Python handler —
         # they fall through to the system-command path, which is exactly
         # what we want a ProcessSlot for.
         if cmd is not None and cmd.has_any_handler():
             return None
-        return tokens
+        return tokens, env_prefix
 
     def _execute_pipeline(
         self,
@@ -2390,6 +2468,11 @@ class Shell:
             if not tokens:
                 continue
 
+            # Per-command env prefix (``FOO=bar cmd``) applies to this stage only.
+            env_prefix, tokens = self._split_env_prefix(tokens)
+            if not tokens:
+                continue
+
             cmd = self.registry.get(tokens[0])
             if cmd is not None and not cmd.has_any_handler():
                 cmd = None
@@ -2436,6 +2519,7 @@ class Shell:
                     stdin_file=stdin_file,
                     stdout_file=stdout_file,
                     stderr_dst=stderr_dst,
+                    env_prefix=env_prefix,
                 )
             else:
                 stdin_arg = stdin_file if stdin_file else stdin_fd_pipe
@@ -2446,7 +2530,7 @@ class Shell:
                         stdin=stdin_arg,
                         stdout=stdout_arg,
                         stderr=stderr_dst,
-                        env=dict(os.environ),
+                        env=self._merged_env(env_prefix),
                         cwd=os.getcwd(),
                     )
                 except FileNotFoundError:
@@ -2550,6 +2634,7 @@ class Shell:
         stdin_file,
         stdout_file,
         stderr_dst,
+        env_prefix: dict[str, str] | None = None,
     ) -> "_PyStageHandle":
         """Run a registered Python command as one stage of a pipeline.
 
@@ -2557,6 +2642,11 @@ class Shell:
         ends) or, when an explicit redirect is in play, the corresponding
         opened file object.  It binds them to thread-local
         sys.stdin/sys.stdout/sys.stderr for the duration of cmd.invoke().
+
+        *env_prefix* (from a ``FOO=bar pycmd`` stage) is applied to the
+        process-wide ``os.environ`` around ``cmd.invoke()``.  See
+        :meth:`_temp_environ` for the sibling-visibility caveat this carries
+        in a multi-stage pipeline.
         """
         # Decide which underlying object the thread owns.  Exactly one of
         # (stdin_fd, stdin_file) is set when this stage has any stdin source,
@@ -2599,7 +2689,8 @@ class Shell:
                     sys.stderr.set_override(err_wrapper)
 
                 try:
-                    cmd.invoke(args)
+                    with self._temp_environ(env_prefix or {}):
+                        cmd.invoke(args)
                     handle.exit_code = 0
                 except SystemExit as e:
                     # Don't propagate; an `exit | cat` should not kill the shell.
@@ -2791,6 +2882,10 @@ class Shell:
                 self._set_variable(m.group(1), m.group(2))
             return 0
 
+        # Per-command env prefix (``FOO=bar cmd args``): the assignments apply
+        # only to this command, not the shell.
+        env_prefix, tokens = self._split_env_prefix(tokens)
+
         command_name = tokens[0]
         args = tokens[1:]
 
@@ -2852,7 +2947,8 @@ class Shell:
                         sys.stderr = sys.stdout
                     elif stderr_override:
                         sys.stderr = io.TextIOWrapper(stderr_override)
-                    cmd.invoke(args)
+                    with self._temp_environ(env_prefix):
+                        cmd.invoke(args)
                 except SystemExit:
                     raise
                 except TypeError as e:
@@ -2883,13 +2979,20 @@ class Shell:
                 # context switching, so run the Python command synchronously.
                 # passthrough_run/passthrough_input fall back to direct
                 # subprocess.run/input since no slot is registered.
-                return self._run_python_command_sync(cmd, command_name, args)
+                with self._temp_environ(env_prefix):
+                    return self._run_python_command_sync(cmd, command_name, args)
             else:
                 # Interactive Python command — run in a thread so Ctrl+] works.
+                # The per-command env prefix is applied for the duration of the
+                # foreground run.  If the command is backgrounded via Ctrl+]
+                # (result == "switched") the prefix is restored here — a
+                # backgrounded Python command does not keep the temporary env,
+                # matching the in-process-model caveats in doc/limitations.md.
                 ctx = self.context_manager.current()
                 slot = PythonCommandSlot(cmd, args)
-                slot.start()
-                result = self._enter_python_forwarding_mode(slot)
+                with self._temp_environ(env_prefix):
+                    slot.start()
+                    result = self._enter_python_forwarding_mode(slot)
                 if result == "switched":
                     slot.deactivate()
                     if ctx is not None:
@@ -2922,7 +3025,7 @@ class Shell:
                     stdin=stdin_arg,
                     stdout=stdout_arg,
                     stderr=stderr_arg,
-                    env=dict(os.environ),
+                    env=self._merged_env(env_prefix),
                     cwd=os.getcwd(),
                 )
             except FileNotFoundError:
@@ -2945,7 +3048,7 @@ class Shell:
                         pass
             return p.returncode
         else:
-            return self._execute_external(command_name, args)
+            return self._execute_external(command_name, args, env_prefix=env_prefix)
 
     def _run_python_command_sync(self, cmd, command_name: str, args: list[str]) -> int:
         """Invoke a Python command on the main thread (Windows path)."""
@@ -2965,7 +3068,9 @@ class Shell:
             return 1
         return 0
 
-    def _execute_external_windows(self, command_name: str, args: list[str]) -> int:
+    def _execute_external_windows(
+        self, command_name: str, args: list[str], env_prefix: dict[str, str] | None = None
+    ) -> int:
         """Run an external command on the real console (Windows path).
 
         Without ConPTY-based multiplexing, the child simply inherits the
@@ -2973,7 +3078,7 @@ class Shell:
         …) rather than real executables are retried via ``cmd /c``.
         """
         argv = [command_name] + args
-        env = dict(os.environ)
+        env = self._merged_env(env_prefix or {})
         cwd = os.getcwd()
         try:
             return subprocess.run(argv, env=env, cwd=cwd).returncode
@@ -2990,9 +3095,11 @@ class Shell:
             print(f"cshell2: {e}")
             return 1
 
-    def _execute_external(self, command_name: str, args: list[str]) -> int:
+    def _execute_external(
+        self, command_name: str, args: list[str], env_prefix: dict[str, str] | None = None
+    ) -> int:
         if IS_WINDOWS:
-            return self._execute_external_windows(command_name, args)
+            return self._execute_external_windows(command_name, args, env_prefix)
 
         ctx = self.context_manager.current()
 
@@ -3000,7 +3107,7 @@ class Shell:
         try:
             slot.start(
                 argv=[command_name] + args,
-                env=dict(os.environ),
+                env=self._merged_env(env_prefix or {}),
                 cwd=os.getcwd(),
             )
         except FileNotFoundError:

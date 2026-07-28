@@ -3,6 +3,7 @@ import tempfile
 
 from cshell2.completion import (
     ChoiceCompleter,
+    CommandNameCompleter,
     CompletionContext,
     ConditionalCompleter,
     FileCompleter,
@@ -136,6 +137,85 @@ def test_positional_index_value_taking_flags_consume_value_token():
     assert _positional_index(["-b", "main", "prod"], oc) == 1
     # mixed: "deploy -n prod -t 60 api <TAB>" → positional = 2
     assert _positional_index(["-n", "prod", "-t", "60", "api"], oc) == 2
+
+
+class _EmptyRegistry:
+    """Minimal registry stub for CommandNameCompleter — no registered commands."""
+
+    def list_commands(self):
+        return []
+
+    def get(self, name):
+        return None
+
+    def list_aliases(self):
+        return {}
+
+
+def test_command_name_completer_offers_local_directories():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.mkdir(os.path.join(tmpdir, "scripts"))
+        open(os.path.join(tmpdir, "runme.sh"), "w").close()
+        old_cwd = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            c = CommandNameCompleter(_EmptyRegistry())
+            results = c.complete(make_ctx(prefix="scr", command=None))
+            values = [r.value for r in results]
+            assert "scripts/" in values
+        finally:
+            os.chdir(old_cwd)
+
+
+def test_command_name_completer_offers_local_executable_with_path_prefix():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        exe = os.path.join(tmpdir, "deploy.sh")
+        open(exe, "w").close()
+        os.chmod(exe, 0o755)
+        open(os.path.join(tmpdir, "notes.txt"), "w").close()
+        old_cwd = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            c = CommandNameCompleter(_EmptyRegistry())
+            # Path-shaped prefix ("./") → local executables are offered.
+            results = c.complete(make_ctx(prefix="./dep", command=None))
+            values = [r.value for r in results]
+            assert "./deploy.sh" in values
+            # Non-executable files are never command candidates.
+            results = c.complete(make_ctx(prefix="./not", command=None))
+            assert not any(r.value.endswith("notes.txt") for r in results)
+        finally:
+            os.chdir(old_cwd)
+
+
+def test_command_name_completer_hides_bare_local_executables():
+    """A bare (non-path) prefix must not offer cwd executables — they'd
+    insert a value that resolves via PATH, not the local file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        exe = os.path.join(tmpdir, "deploy.sh")
+        open(exe, "w").close()
+        os.chmod(exe, 0o755)
+        old_cwd = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            c = CommandNameCompleter(_EmptyRegistry())
+            results = c.complete(make_ctx(prefix="dep", command=None))
+            assert not any(r.value == "deploy.sh" for r in results)
+        finally:
+            os.chdir(old_cwd)
+
+
+def test_command_name_completer_empty_prefix_no_local_flood():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.mkdir(os.path.join(tmpdir, "adir"))
+        old_cwd = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            c = CommandNameCompleter(_EmptyRegistry())
+            results = c.complete(make_ctx(prefix="", command=None))
+            assert not any(r.value == "adir/" for r in results)
+        finally:
+            os.chdir(old_cwd)
 
 
 def test_completer_receives_shell_context():

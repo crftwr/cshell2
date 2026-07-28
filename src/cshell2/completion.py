@@ -174,6 +174,11 @@ class CommandNameCompleter(Completer):
                 results.append(Completion(value=name, description="system"))
                 seen.add(name)
 
+        for comp in self._find_local_commands(prefix):
+            if comp.value not in seen:
+                results.append(comp)
+                seen.add(comp.value)
+
         return results
 
     def _find_system_commands(self, prefix: str) -> list[str]:
@@ -192,6 +197,50 @@ class CommandNameCompleter(Completer):
                     if os.access(full, os.X_OK):
                         seen.add(entry)
         return sorted(seen)
+
+    def _find_local_commands(self, prefix: str) -> list[Completion]:
+        """Complete runnable paths under the current directory at the command position.
+
+        Offers two kinds of candidate so a script or tool that lives in the
+        working tree — not on ``PATH`` — can be launched by TAB:
+
+        * **Directories** matching the prefix (with a trailing ``/``), so the
+          user can drill toward a nested executable (``scripts/`` → ``scripts/deploy.sh``).
+        * **Executable files**, but only when *prefix* already names a path
+          (contains ``/`` or starts with ``.``/``~``).  A bare executable in
+          ``.`` must be run as ``./tool`` to actually invoke the local file
+          rather than a same-named binary on ``PATH``; offering a bare ``tool``
+          value here would insert something that doesn't run what it shows.
+        """
+        # A bare TAB at an empty command prompt should list commands, not
+        # flood the menu with every directory in the working tree.
+        if not prefix:
+            return []
+        expanded = os.path.expanduser(prefix)
+        directory = os.path.dirname(expanded) or "."
+        partial = os.path.basename(expanded)
+        # Only surface bare executables in the current dir once the user has
+        # committed to a path-shaped prefix; otherwise stick to directories.
+        want_files = "/" in prefix or prefix.startswith((".", "~"))
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return []
+        dirs: list[Completion] = []
+        files: list[Completion] = []
+        for entry in sorted(entries):
+            if entry.startswith(".") and not partial.startswith("."):
+                continue
+            if not entry.lower().startswith(partial.lower()):
+                continue
+            full_path = os.path.join(directory, entry)
+            display_dir = os.path.dirname(prefix) if prefix and os.path.dirname(prefix) else ""
+            display_path = _to_slash(os.path.join(display_dir, entry)) if display_dir else entry
+            if os.path.isdir(full_path):
+                dirs.append(Completion(value=display_path + "/", display=entry + "/", description="directory"))
+            elif want_files and os.access(full_path, os.X_OK):
+                files.append(Completion(value=display_path, display=entry, description="executable"))
+        return dirs + files
 
 
 class ChoiceCompleter(Completer):

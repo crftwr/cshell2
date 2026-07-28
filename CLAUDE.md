@@ -327,7 +327,7 @@ class Completion:
 ```python
 class FileCompleter(Completer): ...       # filesystem paths (files + dirs)
 class DirCompleter(Completer): ...        # directory paths only
-class CommandNameCompleter(Completer): ... # registered + system commands
+class CommandNameCompleter(Completer): ... # registered + system commands, plus cwd dirs / local executables at the command position
 class ChoiceCompleter(Completer):          # static list of choices
     def __init__(self, choices: list[str]): ...
 class CallbackCompleter(Completer):        # dynamic list from a function
@@ -865,6 +865,7 @@ cshell2/
 - Glob expansion `*` `?` `**` ✅ — `expand_globs` with `recursive=True` for `**`
 - Stderr redirect `2>` `2>>` `2>&1` ✅
 - Backslash line continuation `\` ✅ — handled in `shell.py` before execution; continuation lines collected with `"> "` prompt; full joined command stored as one history entry
+- Per-command env prefix `FOO=bar cmd args` ✅ — leading `KEY=VALUE` tokens apply only to that command's environment (`Shell._split_env_prefix`). External children get an explicit `env=`; Python `@registry.command`s get a temporary `os.environ` overlay via `Shell._temp_environ` (see the in-process caveat in that method's docstring). A line that is *only* assignments is still a permanent set; `make FOO=bar` keeps `FOO=bar` as an argument (scan stops at the command name).
 - Command substitution `$(…)` ❌ — not yet implemented
 
 **Tier 3 — Nice to have:** ❌ none yet
