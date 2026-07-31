@@ -484,6 +484,31 @@ def _list_hyperpod_cluster_events_all(
     return events
 
 
+def _hyperpod_event_failure_message(sagemaker_client, cluster_name: str,
+                                    event_id: str) -> str | None:
+    """Fetch an event's ``FailureMessage`` via ``describe_cluster_event``.
+
+    The event summaries returned by ``list_cluster_events`` carry only a
+    ``Description``; the failure message lives in the detailed event under
+    ``EventDetails.EventMetadata.{Cluster|InstanceGroup|InstanceGroupScaling|
+    Instance}.FailureMessage``.  Returns the first non-empty message found, or
+    ``None`` if the call fails or no message is present.
+    """
+    try:
+        response = sagemaker_client.describe_cluster_event(
+            ClusterName=cluster_name, EventId=event_id,
+        )
+    except Exception:                       # best-effort — never break the watch
+        return None
+    metadata = response.get("EventDetails", {}).get("EventMetadata", {})
+    for section in ("Instance", "InstanceGroupScaling", "InstanceGroup",
+                    "Cluster"):
+        message = (metadata.get(section) or {}).get("FailureMessage")
+        if message:
+            return message
+    return None
+
+
 def _hyperpod_transitions_finished(cluster: dict, nodes: list[dict]) -> bool:
     """Return True when the cluster has no in-flight transitions left.
 
@@ -2118,9 +2143,17 @@ def _register_hyperpod(awsut) -> None:
                 target = event.get("InstanceId") or event.get("InstanceGroupName") or ""
                 target = f" {target}" if target else ""
                 level = event.get("EventLevel")
-                level = f"[{level}] " if level else ""
-                emit(f"Event {level}{event['ResourceType']}{target}: "
+                level_prefix = f"[{level}] " if level else ""
+                emit(f"Event {level_prefix}{event['ResourceType']}{target}: "
                      f"{event['Description']}")
+                # Error/Warn events carry a FailureMessage only in the detailed
+                # event; fetch and print it so the cause isn't hidden.
+                if level in ("Error", "Warn"):
+                    message = _hyperpod_event_failure_message(
+                        sm, cluster_name, event["EventId"])
+                    if message:
+                        for line in message.splitlines():
+                            emit(f"  Failure message: {line}")
 
             # Advance the watermark to the newest event time seen so the next
             # call only returns events after it.  Keep the ids sitting exactly
